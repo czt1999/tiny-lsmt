@@ -8,10 +8,13 @@ import (
 	"log"
 	"os"
 	"testing"
+	"time"
 	"tiny-lsmt/store"
 )
 
 func TestWAL(t *testing.T) {
+	log.Printf("=== TestWAL ===")
+
 	path := "/var/tmp/tiny_lsmt/wal"
 	wal := store.NewWAL(path)
 	wal.Clear()
@@ -30,9 +33,13 @@ func TestWAL(t *testing.T) {
 	wal.Close()
 	wal = store.NewWAL(path)
 	log.Printf("WAL keeps commands after restore: %v", wal.Commands)
+
+	log.Println()
 }
 
 func TestSSTable(t *testing.T) {
+	log.Printf("=== TestSSTable ===")
+
 	newTablePath := "/var/tmp/tiny_lsmt"
 	segSize := 5
 
@@ -77,9 +84,13 @@ func TestSSTable(t *testing.T) {
 	sst.Close()
 
 	os.Remove(newTablePath)
+
+	log.Println()
 }
 
 func TestLSMTBase(t *testing.T) {
+	log.Printf("=== TestLSMTBase ===")
+
 	lsmt := store.NewLSMTStore(store.DefaultConfig())
 	_ = lsmt.Start()
 	for i := 1; i < 500; i++ {
@@ -103,9 +114,13 @@ func TestLSMTBase(t *testing.T) {
 		MustGet(t, lsmt, k, v)
 	}
 	lsmt.ShutdownClear()
+
+	log.Println()
 }
 
-func TestLSMTCompact(t *testing.T) {
+func TestLSMTMerge(t *testing.T) {
+	log.Printf("=== TestLSMTMerge ===")
+
 	lsmt := store.NewLSMTStore(store.DefaultConfig())
 	_ = lsmt.Start()
 	for i := 0; i < 3; i++ {
@@ -130,6 +145,50 @@ func TestLSMTCompact(t *testing.T) {
 		MustGet(t, lsmt, k, v)
 	}
 	lsmt.ShutdownClear()
+
+	log.Println()
+}
+
+func TestLSMTCompactBackground(t *testing.T) {
+	log.Printf("=== TestLSMTCompactBackground ===")
+
+	lsmt := store.NewLSMTStore(store.DefaultConfig())
+	_ = lsmt.Start()
+	for i := 1; i <= 50000; i++ {
+		k := fmt.Sprintf("k%5d", i)
+		v := fmt.Sprintf("v%5d", i)
+		MustPut(t, lsmt, k, v)
+		time.Sleep(100 * time.Microsecond)
+	}
+	for i := 1; i <= 50000; i += 5 {
+		k := fmt.Sprintf("k%5d", i)
+		MustRemove(t, lsmt, k)
+		time.Sleep(100 * time.Microsecond)
+	}
+	lsmt.Shutdown()
+	fs, _ := ioutil.ReadDir(store.DEFAULT_PATH + "/sst/")
+	for _, f := range fs {
+		log.Printf(f.Name())
+	}
+
+	run1 := store.LoadLevelRun(store.DEFAULT_PATH + "/level_runs/run_1")
+	log.Printf("run 1 size: %v", run1.Size())
+	run2 := store.LoadLevelRun(store.DEFAULT_PATH + "/level_runs/run_2")
+	log.Printf("run 2 size: %v", run2.Size())
+
+	_ = lsmt.Start()
+	for i := 1; i <= 50000; i++ {
+		k := fmt.Sprintf("k%5d", i)
+		v := fmt.Sprintf("v%5d", i)
+		if (i-1)%5 == 0 {
+			MustGetNil(t, lsmt, k)
+		} else {
+			MustGet(t, lsmt, k, v)
+		}
+	}
+	lsmt.ShutdownClear()
+
+	log.Println()
 }
 
 func MustGet(t *testing.T, lsmt *store.LSMTStore, k string, v string) {
@@ -137,6 +196,14 @@ func MustGet(t *testing.T, lsmt *store.LSMTStore, k string, v string) {
 		panic(err)
 	} else if !bytes.Equal(v2, []byte(v)) {
 		t.Fatalf("get %s failed (expected: %s, got: %s)", k, v, v2)
+	}
+}
+
+func MustGetNil(t *testing.T, lsmt *store.LSMTStore, k string) {
+	if v2, err := lsmt.Get([]byte(k)); err != nil {
+		panic(err)
+	} else if v2 != nil {
+		t.Fatalf("get %s failed (expected: nil, got: %s)", k, v2)
 	}
 }
 

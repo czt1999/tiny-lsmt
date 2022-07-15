@@ -203,7 +203,7 @@ func (s *SSTable) Find(key []byte) *Cmd {
 	if target.StartKey == nil {
 		return nil
 	}
-	log.Printf("[SSTable][Find] %s key %s locates at %v [%s, %s]", s.Path, key, target.SegPos.Start, target.StartKey, target.EndKey)
+	//log.Printf("[SSTable][Find] %s key %s locates at %v [%s, %s]", s.Path, key, target.SegPos.Start, target.StartKey, target.EndKey)
 	// read segment data with certainty
 	data := &CmdList{}
 	data.FromBytes(util.MustReadN(s.f, int64(target.SegPos.Start), target.SegPos.Len))
@@ -247,4 +247,18 @@ func (s *SSTable) Close() {
 			log.Printf("[SSTable][Close] close file err %v", err)
 		}
 	}
+}
+
+type TableSlice []*SSTable
+
+func (t TableSlice) Len() int {
+	return len(t)
+}
+
+func (t TableSlice) Less(i, j int) bool {
+	return bytes.Compare(t[i].StartKey, t[j].EndKey) < 0
+}
+
+func (t TableSlice) Swap(i, j int) {
+	t[i], t[j] = t[j], t[i]
 }

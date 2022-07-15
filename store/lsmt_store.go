@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/google/btree"
+	"io"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"time"
 	"tiny-lsmt/util"
@@ -21,8 +23,9 @@ const (
 	DEFAULT_SSTABLE_THRESHOLD = 500
 	DEFAULT_SSTABLE_SEG_SIZE  = 20
 	DEFAULT_LEVEL_NUM         = 3
-	DEFAULT_LEVEL_1_THRESHOLD = 3
-	DEFAULT_LEVEL_2_THRESHOLD = 30
+	DEFAULT_LEVEL_1_THRESHOLD = 1
+	DEFAULT_LEVEL_2_THRESHOLD = 10
+	MB                        = 1024 * 1024
 )
 
 // LSMTConfig keeps configuration info for LSMTStore
@@ -77,12 +80,13 @@ func LoadLevelRun(path string) *LevelRun {
 	var offset int64
 	var nextTablePathLen int64
 	for offset < fsize {
+		f.Seek(offset, io.SeekStart)
 		util.MustReadBigEndian(f, &nextTablePathLen)
 		offset += 8
 		tpath := string(util.MustReadN(f, offset, uint64(nextTablePathLen)))
 		t := &SSTable{Path: tpath}
-		t.Restore()
 		log.Printf("[LoadLevelRun] %v restore table %v", path, tpath)
+		t.Restore()
 		r.tables[t.Path] = t
 		offset += nextTablePathLen
 	}
@@ -96,14 +100,18 @@ func (r *LevelRun) Sync() {
 	}
 	r.f = f
 	var offset int64
-	for tpath := range r.tables {
+	_ = f.Truncate(0)
+	log.Printf("[LevelRun][Sync] %v begin sync", r.path)
+
+	for tpath, t := range r.tables {
 		bts := []byte(tpath)
 		tablePathLen := int64(len(bts))
+		f.Seek(offset, io.SeekStart)
 		util.MustWriteBigEndian(f, tablePathLen)
 		offset += 8
 		util.MustWriteAt(f, offset, bts)
 		offset += tablePathLen
-		log.Printf("[LoadLevelRun] %v save table %v", r.path, tpath)
+		log.Printf("[LevelRun][Sync] %v save table %v [%s, %s]", r.path, tpath, t.StartKey, t.EndKey)
 	}
 	_ = f.Sync()
 }
@@ -123,11 +131,17 @@ func (r *LevelRun) Merge(t *SSTable, cfg *LSMTConfig) error {
 	if t == nil || len(t.StartKey) == 0 || len(t.EndKey) == 0 {
 		return errors.New("invalid table")
 	}
+	log.Printf("[LevelRun][Merge] coming table [%s, %s]", t.StartKey, t.EndKey)
 	mergeWith := r.Overlap(t)
 	if len(mergeWith) == 0 {
 		r.tables[t.Path] = t
 		r.Sync()
 		return nil
+	}
+	sort.Sort(TableSlice(mergeWith))
+	log.Printf("[Merge] mergeWith (sorted):")
+	for _, m := range mergeWith {
+		log.Printf("[%s, %s]", m.StartKey, m.EndKey)
 	}
 	// should merge
 	tdata := t.Data()
@@ -139,9 +153,11 @@ func (r *LevelRun) Merge(t *SSTable, cfg *LSMTConfig) error {
 		mdata := m.Data()
 		merged, remained := mergeDataInOrder(tdata, mdata, bound, cfg)
 		// save new table
-		newTable := NewSSTable(cfg.Path+"/sst", cfg.SSTableSegSize, merged)
-		r.tables[newTable.Path] = newTable
-		log.Printf("[LevelRun][Merge] save sst %v", newTable.Path)
+		if merged.Len() > 0 {
+			newTable := NewSSTable(cfg.Path+"/sst", cfg.SSTableSegSize, merged)
+			r.tables[newTable.Path] = newTable
+			log.Printf("[LevelRun][Merge] save sst %v [%s, %s] %v", newTable.Path, newTable.StartKey, newTable.EndKey, merged.Len())
+		}
 		// merge remained data with next table
 		tdata = remained
 		delete(r.tables, m.Path)
@@ -157,7 +173,7 @@ func (r *LevelRun) Merge(t *SSTable, cfg *LSMTConfig) error {
 	for _, m := range mergeWith {
 		m.Close()
 		_ = os.Remove(m.Path)
-		log.Printf("[LevelRun][Merge] remove sst %v", m.Path)
+		log.Printf("[LevelRun][Merge] remove sst %v [%s, %s]", m.Path, m.StartKey, m.EndKey)
 	}
 	return nil
 }
@@ -196,8 +212,10 @@ func mergeDataInOrder(d1, d2 *CmdList, bound []byte, cfg *LSMTConfig) (*btree.BT
 		}
 		k += 1
 	}
-	merged := &CmdList{cmds: d3.cmds[:k]}
-	remained := &CmdList{cmds: d3.cmds[k:]}
+	merged := &CmdList{cmds: make([]Cmd, k)}
+	remained := &CmdList{cmds: make([]Cmd, len(d3.cmds)-k)}
+	copy(merged.cmds, d3.cmds[:k])
+	copy(remained.cmds, d3.cmds[k:])
 	return merged.ToTree(), remained
 }
 
@@ -300,13 +318,19 @@ func (l *LSMTStore) Get(key []byte) ([]byte, error) {
 	// try memory records at first
 	byKey := CmdItem{}
 	byKey.Key = key
+	l.mut.RLock()
+	defer l.mut.RUnlock()
 	if item := l.cmds.Get(byKey); item != nil {
 		return item.(CmdItem).Value, nil
 	}
 	// search up-to-down in runs
 	for i := 1; uint64(i) <= l.cfg.LevelNum; i++ {
 		if cmd := l.runs[i].Find(key); cmd != nil {
-			return cmd.Value, nil
+			if cmd.CmdType == CmdType_REMOVE {
+				return nil, nil
+			} else {
+				return cmd.Value, nil
+			}
 		}
 	}
 	return nil, ErrNotFound
@@ -348,15 +372,17 @@ func (l *LSMTStore) exec(c Cmd) error {
 
 func (l *LSMTStore) maybeCompact() {
 	for i := 1; uint64(i) < l.cfg.LevelNum; i++ {
-		if uint64(l.runs[i].Size()) >= l.cfg.LevelThreshold[i] {
+		l.mut.Lock()
+		if uint64(l.runs[i].Size()) >= l.cfg.LevelThreshold[i]*MB {
 			log.Printf("[LSMTStore] compact begin [%v]", i)
 			toNextLevel := l.runs[i].Pick()
 			log.Printf("[LSMTStore] compact pick off %v [%v]", toNextLevel.Path, i)
 			if err := l.runs[i+1].Merge(toNextLevel, l.cfg); err != nil {
 				panic(err)
 			}
-			l.runs[i].RemoveTable(toNextLevel.Path)
+			delete(l.runs[i].tables, toNextLevel.Path)
 		}
+		l.mut.Unlock()
 	}
 }
 
